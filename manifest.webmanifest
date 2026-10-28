@@ -1,0 +1,15 @@
+{
+  "name": "সাকুরা ফার্মা — মেডিসিন শপ সফটওয়্যার",
+  "short_name": "সাকুরা ফার্মা",
+  "description": "সাকুরা ফার্মা (মডেল মেডিসিন শপ) — অফলাইন বিক্রি, স্টক, বাকি ও রিপোর্ট",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#df6596",
+  "lang": "bn",
+  "icons": [
+    {"src": "img/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "img/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ]
+}
