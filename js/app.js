@@ -2,7 +2,7 @@
    সব ডেটা এই ব্রাউজারের IndexedDB-তে থাকে; কোনো সার্ভার বা ইন্টারনেট লাগে না। */
 (function () {
 'use strict';
-const APP_VER = '1.1.0';
+const APP_VER = '1.2.0';
 const STORES = ['medicines', 'batches', 'purchases', 'sales', 'deliveries', 'customers', 'suppliers', 'ledger', 'interactions', 'adr', 'users', 'settings'];
 const FORMS = ['ট্যাবলেট', 'ক্যাপসুল', 'সিরাপ', 'সাসপেনশন', 'ইনজেকশন', 'সাপোজিটরি', 'ড্রপ', 'ক্রিম', 'মলম', 'জেল', 'ইনহেলার', 'পাউডার', 'স্যাশে', 'স্প্রে', 'অন্যান্য'];
 const FORM_EN = { 'ট্যাবলেট': 'Tablet', 'ক্যাপসুল': 'Capsule', 'সিরাপ': 'Syrup', 'সাসপেনশন': 'Suspension', 'ইনজেকশন': 'Injection', 'সাপোজিটরি': 'Suppository', 'ড্রপ': 'Drop', 'ক্রিম': 'Cream', 'মলম': 'Ointment', 'জেল': 'Gel', 'ইনহেলার': 'Inhaler', 'পাউডার': 'Powder', 'স্যাশে': 'Sachet', 'স্প্রে': 'Spray', 'অন্যান্য': 'Other' };
@@ -93,25 +93,46 @@ function openDB() {
 const tx = (store, mode = 'readonly') => idb.transaction(store, mode).objectStore(store);
 const reqP = rq => new Promise((res, rej) => { rq.onsuccess = () => res(rq.result); rq.onerror = () => rej(rq.error); });
 const D = {}; // মেমরি ক্যাশ
-async function loadAll() { for (const s of STORES) D[s] = await reqP(tx(s).getAll()); }
+async function loadAll() { for (const s of STORES) D[s] = await reqP(tx(s).getAll()); VER.medicines++; VER.batches++; }
+const VER = { medicines: 0, batches: 0 }; // ডেটা বদলালে ক্যাশ (সার্চ ইনডেক্স/স্টক) নতুন করে বানাতে
+const bump = st => { if (st in VER) VER[st]++; };
 async function put(store, obj) {
   if (!obj.id) obj.id = uid();
   await reqP(tx(store, 'readwrite').put(obj));
   const arr = D[store]; const i = arr.findIndex(x => x.id === obj.id);
   if (i >= 0) arr[i] = obj; else arr.push(obj);
-  return obj;
+  bump(store); return obj;
 }
 async function putMany(store, list) {
   return new Promise((res, rej) => {
     const t = idb.transaction(store, 'readwrite'); const os = t.objectStore(store);
     list.forEach(o => { if (!o.id) o.id = uid(); os.put(o); });
-    t.oncomplete = () => { const map = new Map(D[store].map(x => [x.id, x])); list.forEach(o => map.set(o.id, o)); D[store] = [...map.values()]; res(); };
+    t.oncomplete = () => { const map = new Map(D[store].map(x => [x.id, x])); list.forEach(o => map.set(o.id, o)); D[store] = [...map.values()]; bump(store); res(); };
     t.onerror = () => rej(t.error);
   });
 }
-async function del(store, id) { await reqP(tx(store, 'readwrite').delete(id)); D[store] = D[store].filter(x => x.id !== id); }
-async function clearStore(store) { await reqP(tx(store, 'readwrite').clear()); D[store] = []; }
-const byId = (store, id) => D[store].find(x => x.id === id);
+async function del(store, id) { await reqP(tx(store, 'readwrite').delete(id)); D[store] = D[store].filter(x => x.id !== id); bump(store); }
+async function clearStore(store) { await reqP(tx(store, 'readwrite').clear()); D[store] = []; bump(store); }
+async function delMany(store, ids) {
+  const set = new Set(ids); if (!set.size) return;
+  await new Promise((res, rej) => { const t = idb.transaction(store, 'readwrite'); const os = t.objectStore(store); set.forEach(id => os.delete(id)); t.oncomplete = res; t.onerror = () => rej(t.error); });
+  D[store] = D[store].filter(x => !set.has(x.id)); bump(store);
+}
+const byId = (store, id) => store === 'medicines' ? medIdx().id.get(id) : D[store].find(x => x.id === id);
+/* ২৫ হাজার ওষুধেও দ্রুত খোঁজার জন্য ইনডেক্স (ডেটা বদলালে নিজে থেকে নতুন হয়) */
+let MI = { v: -1 };
+function medIdx() {
+  if (MI.v !== VER.medicines || MI.n !== D.medicines.length) {
+    const list = D.medicines.map(m => ({ m, b: norm(m.brand), g: norm(m.generic), bn: norm(m.nameBn), c: norm(m.company), bs: null, gs: null }));
+    list.sort((a, b) => a.b < b.b ? -1 : a.b > b.b ? 1 : 0);
+    const gm = new Map(); list.forEach(e => { const a = gm.get(e.g); if (a) a.push(e.m); else gm.set(e.g, [e.m]); });
+    MI = { v: VER.medicines, n: D.medicines.length, list, gm, id: new Map(D.medicines.map(m => [m.id, m])) };
+  }
+  return MI;
+}
+const bSk = e => e.bs ?? (e.bs = latSkel(e.m.brand)); const gSk = e => e.gs ?? (e.gs = latSkel(e.m.generic));
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+const bigList = () => D.medicines.length > 2000;
 const setting = k => (D.settings.find(x => x.id === k) || {}).value;
 const setSetting = (k, v) => put('settings', { id: k, value: v });
 
@@ -170,17 +191,30 @@ async function seedIfEmpty() {
 }
 
 /* ---------- স্টক ---------- */
-function stockOf(medId, includeExpired = false) {
+let SC = { v: -1 };
+function stockMap() { // ওষুধ অনুযায়ী বর্তমান স্টক (মেয়াদ আছে এমন) — একবার হিসাব করে রাখা
   const t = today();
-  return D.batches.filter(b => b.medId === medId && b.qty > 0 && (includeExpired || b.expiry >= t)).reduce((a, b) => a + b.qty, 0);
+  if (SC.v !== VER.batches || SC.d !== t || SC.n !== D.batches.length) {
+    const m = new Map(), any = new Set();
+    for (const b of D.batches) { any.add(b.medId); if (b.qty > 0 && b.expiry >= t) m.set(b.medId, (m.get(b.medId) || 0) + b.qty); }
+    SC = { v: VER.batches, d: t, n: D.batches.length, m, any };
+  }
+  return SC;
 }
+function stockOf(medId, includeExpired = false) {
+  if (includeExpired) return D.batches.filter(b => b.medId === medId && b.qty > 0).reduce((a, b) => a + b.qty, 0);
+  return stockMap().m.get(medId) || 0;
+}
+// ডাটাবেস থেকে আনা যে ওষুধ কখনও কেনা হয়নি, তাকে "কম স্টক" সতর্কতায় ধরা হবে না
+const tracked = m => !m.catalog || stockMap().any.has(m.id);
+const isLow = m => tracked(m) && stockOf(m.id) <= (m.reorder || 0);
 function nearestExpiry(medId) {
   const t = today(); const bs = D.batches.filter(b => b.medId === medId && b.qty > 0 && b.expiry >= t).sort((a, b) => a.expiry.localeCompare(b.expiry));
   return bs[0]?.expiry;
 }
 const medLabel = m => `${m.brand} ${m.strength || ''} ${m.form ? '(' + formL(m.form) + ')' : ''}`.replace(/\s+/g, ' ').trim();
 function alertCounts() {
-  const t = today(); const low = D.medicines.filter(m => stockOf(m.id) <= (m.reorder || 0)).length;
+  const t = today(); const low = D.medicines.filter(isLow).length;
   const exp = D.batches.filter(b => b.qty > 0 && b.expiry < t).length;
   const soon = D.batches.filter(b => b.qty > 0 && b.expiry >= t && b.expiry <= addDays(t, 90)).length;
   return { low, exp, soon, total: low + exp + soon };
@@ -332,21 +366,24 @@ function pageDash(el) {
 /* ---------- POS ---------- */
 const POS = { cart: [], mode: 'retail', disc: '', discType: 'tk', paid: '', paidTouched: false, custName: '', custPhone: '', delivery: false, address: '', dcharge: '', other: '', q: '', sel: 0 };
 const priceFor = (m, mode) => mode === 'wholesale' ? (m.wholesalePrice || m.mrp) : (m.mrp || m.marketPrice);
+let SM = { k: '' };
 function searchMeds(q) {
   const raw = String(q || '').trim(); q = norm(q); if (!q) return [];
+  const key = q + '|' + VER.medicines + '|' + VER.batches + '|' + D.medicines.length; if (SM.k === key) return SM.r;
   const qs = hasBn(raw) ? bnSkel(raw) : ''; // বাংলায় লিখলে উচ্চারণ মিলিয়েও খোঁজা
-  const scored = [];
-  D.medicines.forEach(m => {
-    const b = norm(m.brand), g = norm(m.generic), bn = norm(m.nameBn); let s = 0;
-    if (b.startsWith(q) || (bn && bn.startsWith(q))) s = 100; else if (b.includes(q) || (bn && bn.includes(q))) s = 70; else if (g.startsWith(q)) s = 60; else if (g.includes(q)) s = 40; else if (norm(m.company).includes(q) || (m.barcode && m.barcode === q)) s = 20;
-    else if (qs.length >= 2) { if (latSkel(m.brand).startsWith(qs)) s = 55; else if (latSkel(m.generic).startsWith(qs)) s = 35; }
-    if (s) scored.push({ m, s: s + (stockOf(m.id) > 0 ? 5 : 0), alt: false });
-  });
-  scored.sort((a, b) => b.s - a.s || a.m.brand.localeCompare(b.m.brand));
+  const X = medIdx(); const sm = stockMap().m; const scored = [];
+  for (const e of X.list) {
+    let s = 0;
+    if (e.b.startsWith(q) || (e.bn && e.bn.startsWith(q))) s = 100; else if (e.b.includes(q) || (e.bn && e.bn.includes(q))) s = 70; else if (e.g.startsWith(q)) s = 60; else if (e.g.includes(q)) s = 40; else if (e.c.includes(q) || (e.m.barcode && e.m.barcode === q)) s = 20;
+    else if (qs.length >= 2) { if (bSk(e).startsWith(qs)) s = 55; else if (gSk(e).startsWith(qs)) s = 35; }
+    if (s) scored.push({ m: e.m, s: s + ((sm.get(e.m.id) || 0) > 0 ? 5 : 0) + (e.m.catalog ? 0 : 1), alt: false });
+  }
+  scored.sort((a, b) => b.s - a.s); // ইনডেক্স আগে থেকেই নাম অনুযায়ী সাজানো
   const top = scored.slice(0, 10); const ids = new Set(top.map(x => x.m.id));
-  const gens = new Set(top.filter(x => x.s >= 70).map(x => norm(x.m.generic)));
-  D.medicines.filter(m => !ids.has(m.id) && gens.has(norm(m.generic))).forEach(m => top.push({ m, alt: true }));
-  return top.slice(0, 16);
+  const gens = [...new Set(top.filter(x => x.s >= 70).map(x => norm(x.m.generic)))];
+  const alts = []; gens.forEach(g => (X.gm.get(g) || []).forEach(m => { if (!ids.has(m.id)) { ids.add(m.id); alts.push(m); } }));
+  alts.sort((a, b) => (sm.get(b.id) || 0 ? 1 : 0) - (sm.get(a.id) || 0 ? 1 : 0)).slice(0, 6).forEach(m => top.push({ m, alt: true }));
+  const r = top.slice(0, 16); SM = { k: key, r }; return r;
 }
 function cartTotals() {
   const sub = r2(POS.cart.reduce((a, i) => a + i.qty * i.price, 0));
@@ -382,7 +419,8 @@ function pagePOS(el) {
      <button class="btn xl pri" id="done">${ic('check')} বিক্রি সম্পন্ন <span class="kbd" style="background:transparent;color:#fff;border-color:#fff8">F9</span></button>
    </div></div>`;
   const q = $('#q'); q.focus(); drawResults(); drawCart();
-  q.oninput = () => { POS.q = q.value; POS.sel = 0; drawResults(); };
+  const drawDeb = debounce(drawResults, 120);
+  q.oninput = () => { POS.q = q.value; POS.sel = 0; if (bigList()) drawDeb(); else drawResults(); };
   q.onkeydown = e => {
     const items = searchMeds(POS.q);
     if (e.key === 'ArrowDown') { POS.sel = Math.min(items.length - 1, POS.sel + 1); drawResults(); e.preventDefault(); }
@@ -415,7 +453,7 @@ function drawResults() {
     const m = x.m; const st = stockOf(m.id); let head = '';
     if (x.alt && !altShown) { altShown = true; head = `<div class="small muted" style="margin:10px 4px 6px;font-weight:600">একই জেনেরিকের অন্যান্য ব্র্যান্ড (বিকল্প)</div>`; }
     return head + `<div class="res ${i === POS.sel ? 'sel' : ''} ${st <= 0 ? 'out' : ''}" data-i="${i}">
-      <div><div class="nm">${esc(m.brand)} ${m.nameBn && LG() === 'bn' ? `<span class="small muted" style="font-weight:500">${esc(m.nameBn)}</span> ` : ''}<span style="font-weight:400;font-size:15px">${esc(m.strength)} · ${esc(formL(m.form))}</span> ${x.alt ? '<span class="badge b-teal">বিকল্প</span>' : ''} ${m.rx ? '<span class="badge b-pink">Rx</span>' : ''}</div>
+      <div><div class="nm">${esc(m.brand)} ${m.nameBn && LG() === 'bn' ? `<span class="small muted" style="font-weight:500">${esc(m.nameBn)}</span> ` : ''}<span style="font-weight:400;font-size:15px">${esc(m.strength)} · ${esc(formL(m.form))}</span> ${x.alt ? '<span class="badge b-teal">বিকল্প</span>' : ''} ${m.rx ? '<span class="badge b-pink">Rx</span>' : ''} ${m.controlled ? '<span class="badge ctl">নিয়ন্ত্রিত</span>' : ''}</div>
       <div class="gn">${esc(m.generic)} · ${esc(m.company)}${m.rack ? ' · <span>র‍্যাক ' + esc(m.rack) + '</span>' : ''}</div></div>
       <div class="pr"><b>${tk(priceFor(m, POS.mode))}</b><div class="small ${st <= 0 ? 'muted' : st <= (m.reorder || 0) ? '' : 'muted'}">${st > 0 ? 'স্টক ' + bnNum(st, 0) : 'স্টক নেই'}</div></div></div>`;
   }).join('');
@@ -612,24 +650,26 @@ function printReceipt(s, size) {
 window.__printReceipt = printReceipt; // পরীক্ষার জন্য
 
 /* ---------- ওষুধ তালিকা ---------- */
-const MF = { q: '', form: '', page: 0 };
+const MF = { q: '', form: '', page: 0, src: '' };
 function pageMeds(el) {
   el.innerHTML = `<div class="card">
     <div class="row" style="justify-content:space-between">
       <div class="row" style="flex:1;min-width:260px"><div class="search-wrap" style="flex:1;max-width:460px">${ic('search', 's')}<input class="search" id="mq" style="height:50px;font-size:17px;border-width:1.5px" placeholder="ব্র্যান্ড, জেনেরিক, কোম্পানি বা বাংলা নাম দিয়ে খুঁজুন" value="${esc(MF.q)}"></div>
-      <select class="in" id="mfrm" style="width:auto"><option value="">সব ধরন</option>${FORMS.map(f => `<option value="${f}" ${MF.form === f ? 'selected' : ''}>${formL(f)}</option>`).join('')}</select></div>
-      <div class="row"><button class="btn pri" id="madd">${ic('plus')} নতুন ওষুধ</button>${isOwner() ? `<button class="btn" id="mimp">${ic('upload')} Excel/CSV ইমপোর্ট</button><button class="btn" id="mexp">${ic('download')} Excel এক্সপোর্ট</button>` : ''}</div>
+      <select class="in" id="mfrm" style="width:auto"><option value="">সব ধরন</option>${FORMS.map(f => `<option value="${f}" ${MF.form === f ? 'selected' : ''}>${formL(f)}</option>`).join('')}</select>
+      <select class="in" id="msrc" style="width:auto">${[['', 'সব ওষুধ'], ['mine', 'আমার তালিকা'], ['stock', 'স্টকে আছে'], ['bddb', 'BD ডাটাবেস থেকে']].map(o => `<option value="${o[0]}" ${MF.src === o[0] ? 'selected' : ''}>${o[1]}</option>`).join('')}</select></div>
+      <div class="row"><button class="btn pri" id="madd">${ic('plus')} নতুন ওষুধ</button>${isOwner() ? `<button class="btn" id="mimp">${ic('upload')} Excel/CSV ইমপোর্ট</button><button class="btn" id="mexp">${ic('download')} Excel এক্সপোর্ট</button><button class="btn teal" id="mbd">${ic('download')} BD ডাটাবেস</button>` : ''}</div>
     </div><div id="mlist" class="mt"></div></div>`;
   const draw = () => {
-    const q = norm(MF.q); const qs = hasBn(MF.q) ? bnSkel(MF.q) : '';
-    let list = D.medicines.filter(m => (!MF.form || m.form === MF.form) && (!q || norm(m.brand + ' ' + m.generic + ' ' + m.company + ' ' + (m.nameBn || '')).includes(q) || (qs.length >= 2 && (latSkel(m.brand).startsWith(qs) || latSkel(m.generic).startsWith(qs)))));
-    list.sort((a, b) => a.brand.localeCompare(b.brand));
+    const q = norm(MF.q); const qs = hasBn(MF.q) ? bnSkel(MF.q) : ''; const sm = stockMap().m;
+    const hits = medIdx().list.filter(e => { const m = e.m; return (!MF.form || m.form === MF.form) && (!MF.src || (MF.src === 'mine' ? !m.catalog : MF.src === 'bddb' ? !!m.catalog : sm.get(m.id) > 0)) && (!q || e.b.includes(q) || e.g.includes(q) || e.c.includes(q) || (e.bn && e.bn.includes(q)) || (qs.length >= 2 && (bSk(e).startsWith(qs) || gSk(e).startsWith(qs)))); });
+    const rank = e => !q ? 0 : (e.b.startsWith(q) || (e.bn && e.bn.startsWith(q))) ? 0 : (e.b.includes(q) || (e.bn && e.bn.includes(q))) ? 1 : e.g.includes(q) ? 2 : (qs.length >= 2 && bSk(e).startsWith(qs)) ? 3 : 4;
+    const list = q ? hits.map(e => [rank(e), e]).sort((x, y) => x[0] - y[0]).map(x => x[1].m) : hits.map(e => e.m);
     const box = $('#mlist');
     if (!D.medicines.length) { box.innerHTML = empty('💊', 'এখনও কোনো ওষুধ যোগ করা হয়নি', '"নতুন ওষুধ" চাপুন, অথবা Excel/CSV থেকে একসাথে অনেক ওষুধ ইমপোর্ট করুন।'); return; }
     if (!list.length) { box.innerHTML = empty('🔍', 'এই নামে কোনো ওষুধ নেই', 'অন্য বানানে খুঁজুন বা নতুন ওষুধ যোগ করুন।'); return; }
     const shown = list.slice(0, 300);
     box.innerHTML = `<div class="small muted mb">মোট ${bnNum(list.length, 0)}টি ওষুধ${list.length > 300 ? ' <span>(প্রথম ৩০০টি দেখানো হচ্ছে — খুঁজে নির্দিষ্ট করুন)</span>' : ''}</div><div class="twrap"><table class="tbl"><tr><th>ব্র্যান্ড</th><th>জেনেরিক</th><th>শক্তি · ধরন</th><th class="hide-m">কোম্পানি</th><th class="hide-m">র‍্যাক</th>${isOwner() ? '<th class="num">ক্রয়মূল্য</th>' : ''}<th class="num hide-m">বাজারদর</th><th class="num">পাইকারি</th><th class="num">MRP</th><th class="num">স্টক</th><th></th></tr>
-    ${shown.map(m => { const st = stockOf(m.id); return `<tr><td><b>${esc(m.brand)}</b> ${m.sample ? '<span class="badge sample">নমুনা</span>' : ''}${m.nameBn && LG() === 'bn' ? `<div class="small muted">${esc(m.nameBn)}</div>` : ''}</td><td>${esc(m.generic)}</td><td>${esc(m.strength)} · ${esc(formL(m.form))}</td><td class="hide-m">${esc(m.company)}</td><td class="hide-m">${esc(m.rack)}</td>${isOwner() ? `<td class="num">${tk(m.purchasePrice)}</td>` : ''}<td class="num hide-m">${tk(m.marketPrice)}</td><td class="num">${tk(m.wholesalePrice)}</td><td class="num"><b>${tk(m.mrp)}</b></td><td class="num"><span class="badge ${st <= 0 ? 'b-red' : st <= (m.reorder || 0) ? 'b-amber' : 'b-green'}">${bnNum(st, 0)}</span></td>
+    ${shown.map(m => { const st = stockOf(m.id); return `<tr><td><b>${esc(m.brand)}</b> ${m.sample ? '<span class="badge sample">নমুনা</span>' : ''}${m.catalog ? ' <span class="badge b-teal" title="BDDrugBank (medex.com.bd, সেপ্টেম্বর ২০২৫)">ডাটাবেস</span>' : ''}${m.controlled ? ' <span class="badge ctl">নিয়ন্ত্রিত</span>' : ''}${m.priceFlag ? ' <span class="badge b-amber" title="উৎসে দাম নেই বা সন্দেহজনক — যাচাই করুন">দাম যাচাই</span>' : ''}${m.nameBn && LG() === 'bn' ? `<div class="small muted">${esc(m.nameBn)}</div>` : ''}</td><td>${esc(m.generic)}</td><td>${esc(m.strength)} · ${esc(formL(m.form))}</td><td class="hide-m">${esc(m.company)}</td><td class="hide-m">${esc(m.rack)}</td>${isOwner() ? `<td class="num">${tk(m.purchasePrice)}${m.priceEst ? '<div><span class="badge est" title="ডাটাবেসের MRP থেকে হিসাব করা — ইনভয়েস দেখে ঠিক করুন">আনুমানিক</span></div>' : ''}</td>` : ''}<td class="num hide-m">${tk(m.marketPrice)}</td><td class="num">${tk(m.wholesalePrice)}${m.priceEst ? '<div><span class="badge est">আনুমানিক</span></div>' : ''}</td><td class="num"><b>${tk(m.mrp)}</b></td><td class="num"><span class="badge ${st <= 0 ? 'b-red' : st <= (m.reorder || 0) ? 'b-amber' : 'b-green'}">${bnNum(st, 0)}</span></td>
       <td class="right" style="white-space:nowrap"><button class="iconbtn" data-e="${m.id}" title="সম্পাদনা">${ic('edit')}</button>${isOwner() ? ` <button class="iconbtn" data-d="${m.id}" title="মুছুন" style="color:var(--red)">${ic('trash')}</button>` : ''}</td></tr>`; }).join('')}</table></div>`;
     $$('[data-e]', box).forEach(b => b.onclick = () => medForm(byId('medicines', b.dataset.e)));
     $$('[data-d]', box).forEach(b => b.onclick = async () => {
@@ -640,10 +680,12 @@ function pageMeds(el) {
     });
   };
   draw();
-  $('#mq').oninput = e => { MF.q = e.target.value; draw(); };
+  const drawDeb = debounce(draw, 120);
+  $('#mq').oninput = e => { MF.q = e.target.value; if (bigList()) drawDeb(); else draw(); };
   $('#mfrm').onchange = e => { MF.form = e.target.value; draw(); };
+  $('#msrc').onchange = e => { MF.src = e.target.value; draw(); };
   $('#madd').onclick = () => medForm(null);
-  if (isOwner()) { $('#mimp').onclick = importDialog; $('#mexp').onclick = exportExcel; }
+  if (isOwner()) { $('#mimp').onclick = importDialog; $('#mexp').onclick = exportExcel; $('#mbd').onclick = bdDialog; }
 }
 function medForm(m, prefill = '') {
   const isNew = !m; m = m || { brand: prefill, form: 'ট্যাবলেট', reorder: 10 };
@@ -659,7 +701,7 @@ function medForm(m, prefill = '') {
   </div></form>
   <datalist id="dlGen">${[...new Set(D.medicines.map(x => x.generic))].map(g => `<option value="${esc(g)}">`).join('')}</datalist>
   <datalist id="dlCo">${[...new Set(D.medicines.map(x => x.company))].map(g => `<option value="${esc(g)}">`).join('')}</datalist><datalist id="dlBrand"></datalist>
-  <div class="small muted">দাম বসান DGDA ও সাপ্লায়ারের ইনভয়েস দেখে। * চিহ্নিত ঘর পূরণ করা বাধ্যতামূলক।</div>`,
+  ${m.priceEst ? `<div class="alert amber">${ic('alert')}<div><b>আনুমানিক দাম:</b> <span>MRP ডাটাবেস (medex.com.bd, সেপ্টেম্বর ২০২৫) থেকে; ক্রয় ও পাইকারি দাম মার্জিন ধরে হিসাব করা। সাপ্লায়ারের ইনভয়েস দেখে ঠিক করুন।</span></div></div>` : ''}<div class="small muted">দাম বসান DGDA ও সাপ্লায়ারের ইনভয়েস দেখে। * চিহ্নিত ঘর পূরণ করা বাধ্যতামূলক।</div>`,
     `<button class="btn" data-c>বাতিল</button><button class="btn pri" data-s>${ic('check')} সংরক্ষণ করুন</button>`);
   $('[data-c]', ov).onclick = ov.close;
   const save = async () => {
@@ -667,6 +709,7 @@ function medForm(m, prefill = '') {
     const v = Object.fromEntries(new FormData(fm).entries());
     const o = { ...m, ...v, rx: !!v.rx, antibiotic: !!v.antibiotic, sample: false };
     ['purchasePrice', 'marketPrice', 'wholesalePrice', 'mrp', 'reorder'].forEach(k => { if (k in v) o[k] = num(v[k]); });
+    if (m.priceEst && (o.purchasePrice !== m.purchasePrice || o.wholesalePrice !== m.wholesalePrice)) { o.priceEst = false; o.priceSource = 'নিজে বসানো'; }
     o.brand = o.brand.trim(); o.generic = o.generic.trim(); o.nameBn = (o.nameBn || '').trim();
     const dup = D.medicines.find(x => x.id !== o.id && norm(x.brand) === norm(o.brand) && norm(x.strength) === norm(o.strength) && x.form === o.form);
     if (dup) return toast('এই ব্র্যান্ড, শক্তি ও ধরনের ওষুধ আগেই আছে', 'err');
@@ -761,7 +804,8 @@ window.__importFile = importFile;
 const PUR = { supplierId: '', invoice: '', date: '', items: [], paid: '', paidTouched: false };
 function pagePurchase(el) {
   if (!PUR.date) PUR.date = today();
-  const medOpts = D.medicines.map(m => `<option value="${esc(medLabel(m) + ' — ' + m.generic + ' [' + m.id + ']')}">`).join('');
+  const optOf = m => `<option value="${esc(medLabel(m) + ' — ' + m.generic + ' [' + m.id + ']')}">`;
+  const medOpts = bigList() ? '' : D.medicines.map(optOf).join('');
   el.innerHTML = `<div class="grid" style="grid-template-columns:minmax(0,1fr)">
   <div class="card"><h3>নতুন ক্রয় (সাপ্লায়ারের ইনভয়েস থেকে স্টক যোগ)</h3>
     <div class="fgrid"><label class="f"><span>সাপ্লায়ার *</span><div class="row" style="flex-wrap:nowrap"><select class="in" id="psup"><option value="">— বাছাই করুন —</option>${D.suppliers.map(s => `<option value="${s.id}" ${PUR.supplierId === s.id ? 'selected' : ''}>${esc(s.name)}</option>`).join('')}</select><button class="iconbtn" id="newSup" title="নতুন সাপ্লায়ার">${ic('plus')}</button></div></label>
@@ -780,6 +824,7 @@ function pagePurchase(el) {
   </div>
   <div class="card"><h3>সাম্প্রতিক ক্রয়</h3><div id="plist"></div></div></div>`;
   const findMed = v => { const m = /\[([^\]]+)\]$/.exec(v); return m ? byId('medicines', m[1]) : D.medicines.find(x => norm(x.brand) === norm(v)); };
+  if (bigList()) $('#pmed').oninput = debounce(() => { const v = $('#pmed').value; if (/\[[^\]]+\]$/.test(v)) return; $('#pmedl').innerHTML = searchMeds(v).map(x => optOf(x.m)).join(''); }, 120);
   $('#pmed').onchange = () => { const m = findMed($('#pmed').value); if (m) { $('#pprice').value = m.purchasePrice || ''; $('#pmrp').value = m.mrp || ''; $('#pbatch').focus(); } };
   $('#psup').onchange = e => PUR.supplierId = e.target.value; $('#pinv').oninput = e => PUR.invoice = e.target.value; $('#pdate').onchange = e => PUR.date = e.target.value;
   $('#newSup').onclick = () => supplierForm(null, () => render());
@@ -807,7 +852,7 @@ async function savePurchase() {
   const total = r2(PUR.items.reduce((a, i) => a + i.qty * i.price, 0)); const paid = PUR.paidTouched ? num(PUR.paid) : total; const due = r2(Math.max(0, total - paid));
   const pur = await put('purchases', { date: PUR.date, supplierId: PUR.supplierId, invoice: PUR.invoice, items: PUR.items, total, paid: Math.min(paid, total), due, user: currentUser?.name || 'মালিক' });
   await putMany('batches', PUR.items.map(i => ({ medId: i.medId, batchNo: i.batchNo, expiry: i.expiry, qty: i.qty, initQty: i.qty, purchasePrice: i.price, supplierId: PUR.supplierId, purchaseId: pur.id, date: PUR.date })));
-  const meds = []; PUR.items.forEach(i => { const m = byId('medicines', i.medId); if (m && (m.purchasePrice !== i.price || m.mrp !== i.mrp)) { meds.push({ ...m, purchasePrice: i.price, mrp: i.mrp, priceDate: PUR.date, priceSource: 'ইনভয়েস ' + (PUR.invoice || '') }); } }); if (meds.length) await putMany('medicines', meds);
+  const meds = []; PUR.items.forEach(i => { const m = byId('medicines', i.medId); if (m && (m.purchasePrice !== i.price || m.mrp !== i.mrp || m.priceEst)) { meds.push({ ...m, purchasePrice: i.price, mrp: i.mrp, priceDate: PUR.date, priceSource: 'ইনভয়েস ' + (PUR.invoice || ''), priceEst: false }); } }); if (meds.length) await putMany('medicines', meds);
   if (due > 0) await put('ledger', { partyType: 'supplier', partyId: PUR.supplierId, kind: 'due', amount: due, date: PUR.date, ref: PUR.invoice || 'ক্রয়', note: 'ক্রয় বাকি' });
   Object.assign(PUR, { invoice: '', items: [], paid: '', paidTouched: false });
   toast('ক্রয় সংরক্ষিত হয়েছে, স্টক বেড়েছে', 'ok'); render();
@@ -883,7 +928,7 @@ function pageAlerts(el) {
   $$('[data-t]', el).forEach(b => b.onclick = () => { alertTab = b.dataset.t; render(); });
   const box = $('#abox');
   if (alertTab === 'low') {
-    const list = D.medicines.map(m => ({ m, st: stockOf(m.id) })).filter(x => x.st <= (x.m.reorder || 0)).sort((a, b) => a.st - b.st);
+    const list = D.medicines.filter(isLow).map(m => ({ m, st: stockOf(m.id) })).sort((a, b) => a.st - b.st);
     box.innerHTML = list.length ? `<div class="row mb" style="justify-content:space-between"><div class="muted">স্টক রি-অর্ডার লেভেলের সমান বা কম — সাপ্লায়ারকে অর্ডার দিন।</div><button class="btn sm" id="ordCsv">${ic('download')} অর্ডার তালিকা (CSV)</button></div><div class="twrap"><table class="tbl"><tr><th>ওষুধ</th><th>জেনেরিক</th><th>কোম্পানি</th><th class="num">বর্তমান স্টক</th><th class="num">রি-অর্ডার লেভেল</th></tr>${list.map(x => `<tr><td><b>${esc(medLabel(x.m))}</b></td><td>${esc(x.m.generic)}</td><td>${esc(x.m.company)}</td><td class="num"><span class="badge ${x.st <= 0 ? 'b-red' : 'b-amber'}">${bnNum(x.st, 0)}</span></td><td class="num">${bnNum(x.m.reorder, 0)}</td></tr>`).join('')}</table></div>` : empty('✅', 'সব ওষুধের স্টক যথেষ্ট আছে', 'কোনো ওষুধ রি-অর্ডার লেভেলের নিচে নামেনি।');
     const oc = $('#ordCsv'); if (oc) oc.onclick = () => download(`reorder_${t}.csv`, csvOf([['brand', 'generic', 'strength', 'form', 'company', 'stock', 'reorder_level', 'suggested_qty']].concat(list.map(x => [x.m.brand, x.m.generic, x.m.strength, FORM_EN[x.m.form] || x.m.form, x.m.company, x.st, x.m.reorder, Math.max(0, x.m.reorder * 2 - x.st)]))), 'text/csv');
     return;
@@ -984,7 +1029,7 @@ function pageReports(el) {
     rows = [['medicine', 'generic', 'qty', 'sales', 'gross_profit']].concat(L.map(x => [x.name, x.generic, x.q, r2(x.t), r2(x.p)]));
     box.innerHTML = L.length ? `<div class="twrap"><table class="tbl"><tr><th>#</th><th>ওষুধ</th><th class="num">পরিমাণ</th><th class="num">বিক্রি</th><th class="num">লাভ</th><th style="width:28%"></th></tr>${L.map((x, k) => `<tr><td>${bnNum(k + 1, 0)}</td><td><b>${esc(x.name)}</b><div class="small muted">${esc(x.generic)}</div></td><td class="num">${bnNum(x.q, 0)}</td><td class="num"><b>${tk(x.t)}</b></td><td class="num">${tk(x.p)}</td><td><div style="height:10px;border-radius:6px;background:linear-gradient(90deg,var(--pink),var(--teal));width:${x.t / mx * 100}%"></div></td></tr>`).join('')}</table></div>` : empty('🏆', 'এই সময়ে কোনো বিক্রি নেই');
   } else if (REP.tab === 'stock') {
-    const t = today(); const L = D.medicines.map(m => { const bs = D.batches.filter(b => b.medId === m.id && b.qty > 0 && b.expiry >= t); const q = bs.reduce((a, b) => a + b.qty, 0); return { m, q, cost: bs.reduce((a, b) => a + b.qty * (b.purchasePrice || 0), 0), mrp: q * (m.mrp || 0), wh: q * (m.wholesalePrice || 0) }; }).filter(x => x.q > 0).sort((a, b) => b.cost - a.cost);
+    const t = today(); const BG = new Map(); D.batches.forEach(b => { if (b.qty > 0 && b.expiry >= t) { const a = BG.get(b.medId); if (a) a.push(b); else BG.set(b.medId, [b]); } }); const L = D.medicines.filter(m => BG.has(m.id)).map(m => { const bs = BG.get(m.id); const q = bs.reduce((a, b) => a + b.qty, 0); return { m, q, cost: bs.reduce((a, b) => a + b.qty * (b.purchasePrice || 0), 0), mrp: q * (m.mrp || 0), wh: q * (m.wholesalePrice || 0) }; }).filter(x => x.q > 0).sort((a, b) => b.cost - a.cost);
     const T = L.reduce((a, x) => ({ cost: a.cost + x.cost, mrp: a.mrp + x.mrp, wh: a.wh + x.wh }), { cost: 0, mrp: 0, wh: 0 });
     rows = [['medicine', 'generic', 'qty', 'cost_value', 'wholesale_value', 'mrp_value']].concat(L.map(x => [medLabel(x.m), x.m.generic, x.q, r2(x.cost), r2(x.wh), r2(x.mrp)]));
     box.innerHTML = `<div class="grid g3 mb"><div class="alert navy" style="margin:0"><div>ক্রয়মূল্যে স্টক<br><b style="font-size:22px">${tk(T.cost)}</b></div></div><div class="alert navy" style="margin:0"><div>পাইকারি দামে<br><b style="font-size:22px">${tk(T.wh)}</b></div></div><div class="alert navy" style="margin:0"><div>MRP-তে (সম্ভাব্য বিক্রি)<br><b style="font-size:22px">${tk(T.mrp)}</b></div></div></div><div class="small muted mb">মেয়াদোত্তীর্ণ স্টক বাদে। এই হিসাব তারিখ-নির্বিশেষে বর্তমান স্টকের।</div>
@@ -1025,6 +1070,7 @@ function pageSettings(el) {
     <label class="row" style="gap:10px;font-weight:600;margin-bottom:12px"><input type="checkbox" id="pinOn" ${setting('pinEnabled') ? 'checked' : ''} style="width:22px;height:22px"> পিন লগইন চালু</label>
     ${D.users.length ? `<table class="tbl mb"><tr><th>নাম</th><th>ভূমিকা</th><th></th></tr>${D.users.map(u => `<tr><td><b>${esc(u.name)}</b></td><td>${u.role === 'owner' ? '<span class="badge b-pink">মালিক</span>' : '<span class="badge">বিক্রেতা</span>'}</td><td class="right"><button class="iconbtn" data-du="${u.id}" style="color:var(--red)">${ic('trash')}</button></td></tr>`).join('')}</table>` : '<div class="muted mb">এখনও কোনো ব্যবহারকারী নেই।</div>'}
     <button class="btn" id="addU">${ic('plus')} ব্যবহারকারী যোগ</button></div>
+  <div class="card"><h3>🇧🇩 বাংলাদেশের ওষুধের ডাটাবেস</h3>${bdInfoHTML()}<div class="row"><button class="btn teal" id="bdLoad">${ic('download')} সম্পূর্ণ বাংলাদেশ ওষুধ ডাটাবেস লোড করুন (২৪,০০০+)</button>${D.medicines.some(m => m.catalog) ? '<button class="btn danger" id="bdDel">ডাটাবেস থেকে আনা ওষুধ সরান</button>' : ''}</div></div>
   <div class="card"><h3>🧪 নমুনা ডেটা</h3><p class="muted" style="margin-top:0">শুরুতে চেষ্টা করার জন্য নমুনা ওষুধ, দাম, স্টক, বিক্রি, গ্রাহক ও সাপ্লায়ার দেওয়া আছে। দামগুলো কাল্পনিক।</p>
     <div class="row"><button class="btn" id="clrTx">নমুনা বিক্রি/স্টক/গ্রাহক মুছুন (ওষুধের নাম রাখুন)</button><button class="btn danger" id="clrAll">সব নমুনা ডেটা মুছুন</button></div></div>
   <div class="card"><h3>⚠️ বিপজ্জনক এলাকা</h3><p class="muted" style="margin-top:0">সব ডেটা মুছে একদম নতুন করে শুরু করুন (আগে ব্যাকআপ নিন)।</p><button class="btn danger" id="reset">${ic('trash')} সব ডেটা মুছুন</button>
@@ -1035,6 +1081,7 @@ function pageSettings(el) {
   $('#ex').onclick = () => exportExcel(); $('#im').onclick = importDialog; $('#tp').onclick = () => exportExcel(true);
   $('#shs').onclick = async () => { await setSetting('shop', { ...shop, ...Object.fromEntries(new FormData($('#shf')).entries()) }); toast('দোকানের তথ্য সংরক্ষিত', 'ok'); render(); };
   $('#addU').onclick = userForm;
+  $('#bdLoad').onclick = bdDialog; const bdd = $('#bdDel'); if (bdd) bdd.onclick = bdRemove;
   $$('[data-du]', el).forEach(b => b.onclick = async () => { const u = byId('users', b.dataset.du); if (u.role === 'owner' && D.users.filter(x => x.role === 'owner').length === 1 && setting('pinEnabled')) return toast('পিন চালু থাকা অবস্থায় শেষ মালিককে মোছা যাবে না', 'err'); if (await confirmBox(`<span>এই ব্যবহারকারীকে মুছবেন:</span> <b>${esc(u.name)}</b>`, 'হ্যাঁ, মুছুন')) { await del('users', u.id); render(); } });
   $('#pinOn').onchange = async e => {
     if (e.target.checked) { if (!D.users.some(u => u.role === 'owner')) { e.target.checked = false; toast('আগে একজন "মালিক" ব্যবহারকারী পিনসহ যোগ করুন', 'err'); return userForm('owner'); } await setSetting('pinEnabled', true); const o = D.users.find(u => u.role === 'owner'); currentUser = currentUser || { id: o.id, name: o.name, role: 'owner' }; toast('পিন লগইন চালু হয়েছে', 'ok'); render(); }
@@ -1044,6 +1091,88 @@ function pageSettings(el) {
   $('#clrTx').onclick = async () => { if (!(await confirmBox('নমুনা বিক্রি, স্টক, গ্রাহক, সাপ্লায়ার ও ডেলিভারি মুছে যাবে। ওষুধের নাম-তালিকা থাকবে (দাম আপনাকে বসাতে হবে)। চালিয়ে যাবেন?', 'হ্যাঁ, মুছুন'))) return; await clearSample(false); };
   $('#clrAll').onclick = async () => { if (!(await confirmBox('সব নমুনা ডেটা (ওষুধ, দাম, স্টক, বিক্রি, গ্রাহক, সাপ্লায়ার) মুছে যাবে। ইন্টার‍্যাকশন তালিকা থাকবে। চালিয়ে যাবেন?', 'হ্যাঁ, মুছুন'))) return; await clearSample(true); };
   $('#reset').onclick = async () => { if (!(await confirmBox('<b>সব ডেটা</b> স্থায়ীভাবে মুছে যাবে — ওষুধ, স্টক, বিক্রি, বাকি খাতা সব। ব্যাকআপ নিয়েছেন?', 'হ্যাঁ, সব মুছুন'))) return; if (!(await confirmBox('শেষবার জিজ্ঞেস করছি — সত্যিই সব মুছবেন? এটি ফেরানো যাবে না।', 'হ্যাঁ, স্থায়ীভাবে মুছুন'))) return; for (const s of STORES) await clearStore(s); await setSetting('seeded', true); await setSetting('shop', shop); await setSetting('saleNo', 0); currentUser = null; toast('সব ডেটা মুছে ফেলা হয়েছে'); render(); };
+}
+/* ---------- বাংলাদেশের ওষুধের ডাটাবেস (BDDrugBank) ইমপোর্ট ---------- */
+const BD_SRC = 'BDDrugBank v1.0.0 (Zenodo 20749707) — medex.com.bd থেকে সংগৃহীত, সেপ্টেম্বর ২০২৫ স্ন্যাপশট; লাইসেন্স: CC-BY-4.0 (Zenodo-তে যেমন লেখা)';
+function bdInfoHTML() {
+  const n = D.medicines.filter(m => m.catalog === 'bddb').length;
+  return `<p class="muted" style="margin-top:0">২৪,৭১৮টি ব্র্যান্ড-ওষুধ: জেনেরিক, শক্তি, ধরন, কোম্পানি, থেরাপিউটিক ক্লাস ও MRP। আমদানি করা ওষুধের স্টক থাকবে ০ — কেনার সময় "ক্রয় / স্টক-ইন" থেকে স্টক যোগ করুন। নমুনা ডেটা আলাদা থাকবে।</p>
+  <div class="alert info">${ic('info')}<div><b>উৎস:</b> <span translate="no">${esc(BD_SRC)}</span>.<br><span>MedEx-এর শর্তে ডেটা শুধু ব্যক্তিগত, অ-বাণিজ্যিক ব্যবহারের জন্য; ব্যবহারের আগে উৎসের শর্ত দেখে নিন।</span><br><b>MRP সেপ্টেম্বর ২০২৫-এর; ক্রয়মূল্য ও পাইকারি দাম আনুমানিক। বিক্রির আগে DGDA ও সাপ্লায়ারের ইনভয়েস দেখে যাচাই করুন।</b></div></div>
+  ${n ? `<div class="small mb"><span>এখন তালিকায় ডাটাবেস থেকে আনা ওষুধ:</span> <b>${bnNum(n, 0)}</b></div>` : ''}`;
+}
+let BD_TRY = null; // সফটওয়্যারের সাথে দেওয়া ডেটা ফাইল একবারই খোঁজা হয়
+function loadBdData() {
+  if (window.BD_MEDS) return Promise.resolve(window.BD_MEDS);
+  if (BD_TRY) return BD_TRY;
+  BD_TRY = new Promise((res, rej) => { const sc = document.createElement('script'); sc.src = 'data/bd_medicines.js'; sc.onload = () => window.BD_MEDS ? res(window.BD_MEDS) : rej(new Error('empty')); sc.onerror = () => { sc.remove(); rej(new Error('missing')); }; document.head.appendChild(sc); });
+  // ফাইল না থাকলে (পাবলিক/GitHub সংস্করণ) এই সেশনে আর খোঁজা হয় না — ফাইল বেছে নিতে বলা হয়
+  return BD_TRY;
+}
+// কম্পিউটারে রাখা bd_medicines.json বা bd_medicines.js ফাইল পড়া (কোড চালানো হয় না, শুধু JSON পড়া হয়)
+function parseBdFile(text) {
+  let t = String(text || '').replace(/^\uFEFF/, '').trim();
+  if (!t.startsWith('{')) { const i = t.indexOf('{'), j = t.lastIndexOf('}'); if (i < 0 || j < i) throw new Error('format'); t = t.slice(i, j + 1); }
+  const B = JSON.parse(t);
+  if (!B || !B.meta || !Array.isArray(B.R) || !Array.isArray(B.AF) || !Array.isArray(B.G) || !Array.isArray(B.C)) throw new Error('format');
+  return B;
+}
+function bdDialog() {
+  const pr = setting('bdPrice') || { margin: 12, wh: 4, disc: 0 }; let fileB = null;
+  const ov = modal('সম্পূর্ণ বাংলাদেশ ওষুধ ডাটাবেস লোড করুন', `${bdInfoHTML()}
+    <div id="bdsrc" class="small muted mb">ডেটা ফাইল খোঁজা হচ্ছে…</div>
+    <div id="bdpick" class="alert amber" style="display:none">${ic('upload')}<div><b>ডেটা ফাইলটি (bd_medicines.json) আপনার কম্পিউটারে রাখা আছে, সেটি বেছে নিন।</b><br><span>The data file (bd_medicines.json) is kept on your computer — please choose it.</span><br><span class="small">ফাইলটি সফটওয়্যারের সাথে (অনলাইন/GitHub সংস্করণে) দেওয়া হয় না। দোকানের কম্পিউটারের "sakura_pharma_db" ফোল্ডারে বা পূর্ণ zip-এর data ফোল্ডারে পাবেন (bd_medicines.json অথবা bd_medicines.js)।</span><br><span class="small">It is not included in the online/GitHub version. Find it in the "sakura_pharma_db" folder on the shop computer, or in the data folder of the full zip.</span>
+      <div class="row mt"><label class="btn">${ic('upload')} ফাইল বেছে নিন / Choose file<input type="file" id="bdfile" accept=".json,.js,application/json,text/javascript" hidden></label><span id="bdfn" class="small"></span></div></div></div>
+    <div class="fgrid"><label class="f"><span>ফার্মেসি মার্জিন (MRP-এর %)</span><input class="in" id="bdm" type="number" min="0" max="50" step="0.5" value="${pr.margin}"></label>
+    <label class="f"><span>পাইকারি মার্কআপ (ক্রয়মূল্যের ওপর %)</span><input class="in" id="bdw" type="number" min="0" max="50" step="0.5" value="${pr.wh}"></label>
+    <label class="f"><span>খুচরা ছাড় (MRP থেকে %, ০–৫)</span><input class="in" id="bdc" type="number" min="0" max="5" step="0.5" value="${pr.disc}"></label></div>
+    <div class="small muted">ক্রয়মূল্য = MRP × (১ − মার্জিন) · পাইকারি = ক্রয়মূল্য × (১ + মার্কআপ) · বাজারদর = MRP × (১ − ছাড়)। সব আনুমানিক — "আনুমানিক" চিহ্ন থাকবে।</div>
+    <div id="bdp" class="mt" style="display:none"><div class="pbar"><i id="bdbar"></i></div><div class="small mt" id="bdtxt"></div></div>`,
+    `<button class="btn" data-c>বাতিল</button><button class="btn pri" data-s disabled>${ic('download')} লোড শুরু করুন</button>`);
+  $('[data-c]', ov).onclick = ov.close;
+  const srcEl = $('#bdsrc', ov), startBtn = $('[data-s]', ov);
+  const showPick = () => { srcEl.style.display = 'none'; $('#bdpick', ov).style.display = 'flex'; startBtn.disabled = !fileB; };
+  loadBdData().then(B => { srcEl.innerHTML = `<span>সফটওয়্যারের সাথে দেওয়া ডেটা ফাইল পাওয়া গেছে:</span> <b>${bnNum(B.R.length, 0)}</b> <span>টি ওষুধ।</span>`; startBtn.disabled = false; }).catch(showPick);
+  $('#bdfile', ov).onchange = async e => {
+    const f = e.target.files[0]; if (!f) return; const fn = $('#bdfn', ov); fn.textContent = f.name + ' …';
+    try { fileB = parseBdFile(await f.text()); fn.innerHTML = `<b>${esc(f.name)}</b> — ${bnNum(fileB.R.length, 0)} <span>টি ওষুধ পাওয়া গেছে</span> ✔`; startBtn.disabled = false; }
+    catch (err) { console.warn(err); fileB = null; startBtn.disabled = true; fn.innerHTML = '<span style="color:var(--red)">এই ফাইলটি সঠিক ডেটা ফাইল নয়। bd_medicines.json অথবা bd_medicines.js বেছে নিন।</span>'; }
+  };
+  startBtn.onclick = async () => {
+    const margin = Math.min(50, Math.max(0, num($('#bdm', ov).value))), wh = Math.min(50, Math.max(0, num($('#bdw', ov).value))), disc = Math.min(5, Math.max(0, num($('#bdc', ov).value)));
+    startBtn.disabled = true; $('[data-c]', ov).disabled = true; $('#bdp', ov).style.display = 'block';
+    const bar = $('#bdbar', ov), txt = $('#bdtxt', ov); const set = (p, t) => { bar.style.width = p + '%'; txt.innerHTML = t; };
+    set(3, '<span>ডাটাবেস ফাইল খোলা হচ্ছে…</span>');
+    try {
+      const B = fileB || await loadBdData(); await setSetting('bdPrice', { margin, wh, disc });
+      const r = await bdImport(B, { margin, wh, disc }, (done, total) => set(5 + Math.round(95 * done / total), `<span>সংরক্ষণ হচ্ছে:</span> <b>${bnNum(done, 0)} / ${bnNum(total, 0)}</b>`));
+      await setSetting('bdImported', { at: new Date().toISOString(), count: r.added, snapshot: B.meta.snapshot, from: fileB ? 'file' : 'bundled' });
+      set(100, `<b>${bnNum(r.added, 0)}</b> <span>টি ওষুধ যোগ হয়েছে।</span> ${r.skipped ? `<span>আগে থেকেই ছিল বলে বাদ:</span> <b>${bnNum(r.skipped, 0)}</b>` : ''}`);
+      toast('ডাটাবেস লোড সম্পন্ন', 'ok'); $('[data-c]', ov).disabled = false; $('[data-c]', ov).textContent = 'বন্ধ করুন'; $('[data-c]', ov).onclick = () => { ov.close(); render(); };
+    } catch (e) { console.warn(e); set(0, '<span style="color:var(--red)">ডাটাবেস ফাইল লোড করা যায়নি। ফাইলটি আবার বেছে নিন।</span>'); showPick(); $('[data-c]', ov).disabled = false; }
+  };
+}
+async function bdImport(B, pr, onProg) {
+  const t = today(); const have = new Set(D.medicines.map(m => m.id));
+  const mine = new Set(D.medicines.filter(m => !m.catalog && !m.sample).map(m => norm(m.brand) + '|' + norm(m.strength) + '|' + m.form));
+  const out = []; let skipped = 0;
+  for (const r of B.R) {
+    const form = B.AF[r[5]];
+    if (have.has(r[0]) || mine.has(norm(r[1]) + '|' + norm(r[4]) + '|' + form)) { skipped++; continue; }
+    const mrp = r[10] || 0; const pp = mrp ? r2(mrp * (1 - pr.margin / 100)) : 0; const fl = r[12];
+    out.push({ id: r[0], brand: r[1], nameBn: r[2] || '', generic: B.G[r[3]], strength: r[4] || '', form, dosageForm: B.SF[r[6]], packSize: r[7] ? String(r[7]) : '', company: B.C[r[8]], tclass: B.K[r[9]] || '',
+      mrp, mrpStrip: r[11] || 0, purchasePrice: pp, wholesalePrice: pp ? r2(pp * (1 + pr.wh / 100)) : 0, marketPrice: mrp ? r2(mrp * (1 - pr.disc / 100)) : 0,
+      rx: !!(fl & 1), antibiotic: !!(fl & 2), controlled: !!(fl & 4), priceFlag: !!(fl & 8), reorder: 0, rack: '', barcode: '', dar: '',
+      catalog: 'bddb', priceEst: true, priceSource: 'BDDrugBank (medex.com.bd, Sep 2025) — MRP উৎস থেকে, ক্রয়/পাইকারি আনুমানিক', priceDate: B.meta.snapshot, sample: false, created: t });
+  }
+  const CH = 1000;
+  for (let i = 0; i < out.length; i += CH) { await putMany('medicines', out.slice(i, i + CH)); onProg && onProg(Math.min(out.length, i + CH), out.length); await new Promise(r => setTimeout(r, 0)); }
+  if (!out.length && onProg) onProg(1, 1);
+  return { added: out.length, skipped };
+}
+async function bdRemove() {
+  const used = stockMap().any; const ids = D.medicines.filter(m => m.catalog && !used.has(m.id)).map(m => m.id); const keep = D.medicines.filter(m => m.catalog).length - ids.length;
+  if (!(await confirmBox(`<span>ডাটাবেস থেকে আনা</span> <b>${bnNum(ids.length, 0)}</b> <span>টি ওষুধ সরানো হবে।</span> ${keep ? `<br><small class="muted"><span>যেগুলোর স্টক/ক্রয় আছে সেগুলো থাকবে:</span> ${bnNum(keep, 0)}</small>` : ''}`, 'হ্যাঁ, সরান'))) return;
+  await delMany('medicines', ids); await setSetting('bdImported', null); toast('ডাটাবেসের ওষুধ সরানো হয়েছে', 'ok'); render();
 }
 async function clearSample(all) {
   for (const s of ['sales', 'batches', 'customers', 'suppliers', 'deliveries', 'ledger', 'purchases']) for (const x of D[s].filter(x => x.sample)) await del(s, x.id);
@@ -1079,7 +1208,7 @@ async function init() {
     window.addEventListener('hashchange', () => { const r = location.hash.slice(1); if (r !== route && NAV.some(n => n[0] === r)) { route = r; render(); } });
     render();
     if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
-    window.__app = { D, POS, go, completeSale, addToCart, checkInteractions, render, searchMeds, showReceipt, returnModal, balanceOf, stockOf, saleNet, bnSkel, latSkel };
+    window.__app = { D, POS, go, bdImport, loadBdData, parseBdFile, medIdx, stockMap, completeSale, addToCart, checkInteractions, render, searchMeds, showReceipt, returnModal, balanceOf, stockOf, saleNet, bnSkel, latSkel };
   } catch (err) {
     console.error(err);
     $('#root').innerHTML = `<div style="padding:40px;font-family:sans-serif"><h2>সফটওয়্যার চালু করা যায়নি</h2><p>এই ব্রাউজারে ডেটাবেস (IndexedDB) খোলা যাচ্ছে না। Google Chrome বা Microsoft Edge-এর সাধারণ (Incognito নয়) উইন্ডোতে খুলুন।</p><pre>${esc(err && err.message)}</pre></div>`;
