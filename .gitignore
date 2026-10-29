@@ -1,0 +1,5 @@
+# Medicine dataset stays on the shop computer — never commit it
+data/bd_medicines.*
+bd_medicines.*
+*.xlsx
+*.csv
